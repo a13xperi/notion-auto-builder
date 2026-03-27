@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "notion-auto-builder-dev",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "src/index.ts", "Create a project tracker for engineering"],
+      "port": 3000
+    }
+  ]
+}
