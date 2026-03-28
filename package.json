@@ -13,7 +13,13 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js"
   },
-  "keywords": ["notion", "claude", "ai", "automation", "document-builder"],
+  "keywords": [
+    "notion",
+    "claude",
+    "ai",
+    "automation",
+    "document-builder"
+  ],
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
@@ -21,7 +27,7 @@
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "dotenv": "^16.4.0",
-    "ora": "^8.1.0"
+    "log-update": "^7.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

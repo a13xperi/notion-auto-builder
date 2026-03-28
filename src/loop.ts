@@ -1,20 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Config, BuildReport, CreatedEntity } from "./types.js";
+import type { Config, BuildReport, CreatedEntity, Phase } from "./types.js";
 import { toolDefinitions, ToolExecutor } from "./tools/index.js";
 import { buildSystemPrompt } from "./prompts/system.js";
-import {
-  startSpinner,
-  updateSpinner,
-  succeedSpinner,
-  failSpinner,
-  stopSpinner,
-  logPhase,
-  logInfo,
-  logToolCall,
-  logError,
-  logReport,
-  logPartialReport,
-} from "./ui.js";
+import { createDashboard } from "./ui.js";
 
 const MAX_ROUND_TRIPS = 80;
 
@@ -22,34 +10,27 @@ export async function runLoop(prompt: string, config: Config): Promise<void> {
   const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
   const executor = new ToolExecutor(config.notionApiKey);
   const systemPrompt = buildSystemPrompt(config.maxIterations, config.parentPageId);
+  const dashboard = createDashboard(config, prompt);
 
   const createdEntities: CreatedEntity[] = [];
 
-  // SIGINT handler for partial report
+  // SIGINT handler
   const sigintHandler = () => {
-    stopSpinner();
-    logPartialReport(createdEntities);
+    dashboard.interruptReport();
     process.exit(130);
   };
   process.on("SIGINT", sigintHandler);
 
   const messages: Anthropic.MessageParam[] = [
-    {
-      role: "user",
-      content: prompt,
-    },
+    { role: "user", content: prompt },
   ];
-
-  logPhase("STARTING");
-  logInfo(`Prompt: "${prompt}"`);
-  logInfo(`Model: ${config.model} | Max iterations: ${config.maxIterations}`);
 
   let roundTrips = 0;
 
   try {
     while (roundTrips < MAX_ROUND_TRIPS) {
       roundTrips++;
-      startSpinner(`Thinking... (round ${roundTrips})`);
+      dashboard.update({ round: roundTrips, currentTool: null });
 
       const response = await anthropic.messages.create({
         model: config.model,
@@ -59,38 +40,36 @@ export async function runLoop(prompt: string, config: Config): Promise<void> {
         messages,
       });
 
-      // Push assistant response to history
       messages.push({ role: "assistant", content: response.content });
 
-      // Process text blocks (Claude's reasoning/status)
+      // Process text blocks - detect phase transitions
       for (const block of response.content) {
         if (block.type === "text" && block.text.trim()) {
-          stopSpinner();
-          detectPhase(block.text);
-          if (config.verbose) {
-            logInfo(block.text.slice(0, 200) + (block.text.length > 200 ? "..." : ""));
-          }
+          const phase = detectPhase(block.text);
+          if (phase) dashboard.setPhase(phase);
+          dashboard.setClaudeText(block.text.trim().slice(0, 80));
         }
       }
 
-      // Check for tool use
+      // Collect tool_use blocks
       const toolUseBlocks = response.content.filter(
-        (b): b is Anthropic.ContentBlockParam & { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } =>
-          b.type === "tool_use"
+        (b): b is Anthropic.ContentBlockParam & {
+          type: "tool_use";
+          id: string;
+          name: string;
+          input: Record<string, unknown>;
+        } => b.type === "tool_use"
       );
 
       if (toolUseBlocks.length === 0) {
-        // No tool calls and end_turn - Claude is done talking
         if (response.stop_reason === "end_turn") {
-          stopSpinner();
-          logError("Claude ended without calling report_complete. Outputting partial results.");
-          logPartialReport(createdEntities);
+          dashboard.interruptReport();
           break;
         }
         continue;
       }
 
-      // Execute tool calls
+      // Execute each tool call
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
       for (const toolBlock of toolUseBlocks) {
@@ -98,23 +77,17 @@ export async function runLoop(prompt: string, config: Config): Promise<void> {
 
         // Check for report_complete (loop termination)
         if (name === "report_complete") {
-          succeedSpinner("Build complete!");
           const report = input as unknown as BuildReport;
-
-          // Merge tracked entities with Claude's report
-          if (report.entities?.length) {
-            logReport(report);
-          } else {
-            logPartialReport(createdEntities);
-          }
-
           process.removeListener("SIGINT", sigintHandler);
+          dashboard.finish(report);
           return;
         }
 
-        logToolCall(name, config.verbose);
-        updateSpinner(`Executing: ${name}`);
+        // Show tool as running
+        dashboard.update({ currentTool: name });
+        dashboard.addToolLog({ name, status: "running" });
 
+        // Execute
         const result = await executor.execute(name, input as Record<string, unknown>);
 
         // Track created entities
@@ -126,14 +99,26 @@ export async function runLoop(prompt: string, config: Config): Promise<void> {
               : name.includes("view")
               ? "view"
               : "page";
-            createdEntities.push({
-              name: (data.title as string) ?? (input as Record<string, unknown>).title as string ?? "Untitled",
+            const entity: CreatedEntity = {
+              name:
+                (data.title as string) ??
+                (input as Record<string, unknown>).title as string ??
+                (input as Record<string, unknown>).name as string ??
+                "Untitled",
               type: entityType as CreatedEntity["type"],
               id: data.id as string,
               url: data.url as string,
-            });
+            };
+            createdEntities.push(entity);
+            dashboard.addEntity(entity);
           }
         }
+
+        // Mark tool done
+        const resultSummary = result.success
+          ? (result.data as Record<string, unknown>)?.message as string ?? "OK"
+          : result.error ?? "Error";
+        dashboard.markToolDone(name, result.success ? "success" : "error", resultSummary.slice(0, 30));
 
         toolResults.push({
           type: "tool_result",
@@ -142,32 +127,31 @@ export async function runLoop(prompt: string, config: Config): Promise<void> {
         });
       }
 
-      // Push tool results back
       messages.push({ role: "user", content: toolResults });
     }
 
     if (roundTrips >= MAX_ROUND_TRIPS) {
-      stopSpinner();
-      logError(`Hit max round trips (${MAX_ROUND_TRIPS}). Stopping.`);
-      logPartialReport(createdEntities);
+      dashboard.interruptReport();
     }
   } catch (err: unknown) {
-    stopSpinner();
+    dashboard.interruptReport();
     if (err instanceof Anthropic.APIError) {
-      logError(`Claude API error: ${err.message} (status: ${err.status})`);
+      console.error(`Claude API error: ${err.message} (status: ${err.status})`);
     } else {
-      logError(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
-    logPartialReport(createdEntities);
   } finally {
     process.removeListener("SIGINT", sigintHandler);
   }
 }
 
-function detectPhase(text: string): void {
+function detectPhase(text: string): Phase | null {
   const lower = text.toLowerCase();
-  if (lower.includes("plan")) logPhase("PLAN");
-  else if (lower.includes("build")) logPhase("BUILD");
-  else if (lower.includes("evaluat")) logPhase("EVALUATE");
-  else if (lower.includes("refin")) logPhase("REFINE");
+  // Check for specific phase keywords - order matters (evaluate before refine)
+  if (lower.includes("phase 1") || lower.includes("plan")) return "PLAN";
+  if (lower.includes("phase 2") || (lower.includes("build") && !lower.includes("rebuild")))
+    return "BUILD";
+  if (lower.includes("phase 3") || lower.includes("evaluat")) return "EVALUATE";
+  if (lower.includes("phase 4") || lower.includes("refin")) return "REFINE";
+  return null;
 }

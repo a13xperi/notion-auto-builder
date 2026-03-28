@@ -40,3 +40,27 @@ export type ToolResult = {
   data?: unknown;
   error?: string;
 };
+
+export interface ToolLogEntry {
+  name: string;
+  status: "running" | "success" | "error";
+  result?: string;
+}
+
+export type Phase = "STARTING" | "PLAN" | "BUILD" | "EVALUATE" | "REFINE" | "COMPLETE";
+
+export interface DashboardState {
+  phase: Phase;
+  round: number;
+  maxRounds: number;
+  iteration: number;
+  maxIterations: number;
+  currentTool: string | null;
+  entities: CreatedEntity[];
+  scores: QualityScores | null;
+  toolLog: ToolLogEntry[];
+  spinnerFrame: number;
+  claudeText: string;
+  prompt: string;
+  model: string;
+}

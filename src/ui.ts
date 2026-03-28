@@ -1,109 +1,347 @@
 import chalk from "chalk";
-import ora, { type Ora } from "ora";
-import type { BuildReport, CreatedEntity } from "./types.js";
+import logUpdate from "log-update";
+import type {
+  Config,
+  DashboardState,
+  CreatedEntity,
+  ToolLogEntry,
+  QualityScores,
+  BuildReport,
+  Phase,
+} from "./types.js";
 
-let spinner: Ora | null = null;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const WIDTH = 64;
 
-export function startSpinner(text: string): void {
-  spinner = ora({ text, color: "cyan" }).start();
+// ── Box Drawing Helpers ──
+
+function hLine(left: string, fill: string, right: string, w = WIDTH): string {
+  return left + fill.repeat(w - 2) + right;
 }
 
-export function updateSpinner(text: string): void {
-  if (spinner) spinner.text = text;
+function row(content: string, w = WIDTH): string {
+  const stripped = stripAnsi(content);
+  const pad = Math.max(0, w - 4 - stripped.length);
+  return `║ ${content}${" ".repeat(pad)} ║`;
 }
 
-export function succeedSpinner(text: string): void {
-  if (spinner) spinner.succeed(text);
-  spinner = null;
+function emptyRow(w = WIDTH): string {
+  return row("", w);
 }
 
-export function failSpinner(text: string): void {
-  if (spinner) spinner.fail(text);
-  spinner = null;
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-export function stopSpinner(): void {
-  if (spinner) spinner.stop();
-  spinner = null;
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 3) + "...";
 }
 
-export function logPhase(phase: string): void {
-  stopSpinner();
-  console.log(chalk.bold.cyan(`\n[${ phase }]`));
+function shortUrl(url: string): string {
+  return url.replace("https://www.notion.so/", "notion.so/").slice(0, 30);
 }
 
-export function logInfo(msg: string): void {
-  console.log(chalk.gray(`  ${msg}`));
+// ── Render Sections ──
+
+function renderHeader(state: DashboardState): string {
+  const title = chalk.bold.cyan("NOTION AUTO-BUILDER");
+  const roundStr = chalk.dim(`Round ${String(state.round).padStart(2)} / ${state.maxRounds}`);
+  const titleLen = stripAnsi(title).length;
+  const roundLen = stripAnsi(roundStr).length;
+  const gap = WIDTH - 4 - titleLen - roundLen;
+  const content = `${title}${" ".repeat(Math.max(1, gap))}${roundStr}`;
+  return [
+    chalk.cyan(hLine("╔", "═", "╗")),
+    chalk.cyan("║") + ` ${content}` + " ".repeat(Math.max(0, WIDTH - 4 - stripAnsi(content).length)) + chalk.cyan(" ║"),
+    chalk.cyan(hLine("╠", "═", "╣")),
+  ].join("\n");
 }
 
-export function logSuccess(msg: string): void {
-  console.log(chalk.green(`  ${msg}`));
-}
-
-export function logWarn(msg: string): void {
-  console.log(chalk.yellow(`  ${msg}`));
-}
-
-export function logError(msg: string): void {
-  console.log(chalk.red(`  ${msg}`));
-}
-
-export function logToolCall(name: string, verbose: boolean): void {
-  if (verbose) {
-    console.log(chalk.dim(`    -> ${name}`));
-  }
-}
-
-export function logScores(scores: Record<string, number>): void {
-  console.log(chalk.bold("\n  Quality Scores:"));
-  for (const [dimension, score] of Object.entries(scores)) {
-    const color = score >= 4 ? chalk.green : score >= 3 ? chalk.yellow : chalk.red;
-    const bar = "█".repeat(score) + "░".repeat(5 - score);
-    console.log(`    ${dimension.padEnd(28)} ${color(bar)} ${color(score + "/5")}`);
-  }
-  const avg = Object.values(scores).reduce((a, b) => a + b, 0) / Object.values(scores).length;
-  console.log(chalk.bold(`    ${"Average".padEnd(28)} ${avg.toFixed(1)}/5`));
-}
-
-export function logReport(report: BuildReport): void {
-  console.log(chalk.bold.green("\n\n  Build Complete!\n"));
-
-  console.log(chalk.bold("  Created:"));
-  for (const entity of report.entities) {
-    const icon = entity.type === "database" ? "📊" : entity.type === "view" ? "👁" : "📄";
-    console.log(`    ${icon} ${entity.name} (${entity.type})`);
-    console.log(chalk.dim(`       ${entity.url}`));
-  }
-
-  console.log(chalk.bold("\n  Final Quality Scores:"));
-  const scoreEntries: Record<string, number> = {
-    "Structural Completeness": report.scores.structuralCompleteness,
-    "Content Depth": report.scores.contentDepth,
-    "Notion Feature Usage": report.scores.notionFeatureUsage,
-    "Visual Organization": report.scores.visualOrganization,
-    "Actionability": report.scores.actionability,
-    "Internal Consistency": report.scores.internalConsistency,
+function renderStatus(state: DashboardState): string {
+  const phaseColors: Record<Phase, (s: string) => string> = {
+    STARTING: chalk.gray,
+    PLAN: chalk.blue,
+    BUILD: chalk.yellow,
+    EVALUATE: chalk.magenta,
+    REFINE: chalk.green,
+    COMPLETE: chalk.greenBright,
   };
-  logScores(scoreEntries);
+  const colorFn = phaseColors[state.phase] ?? chalk.white;
+  const phaseStr = colorFn(chalk.bold(state.phase));
+  const iterStr = chalk.dim(`Iteration: ${state.iteration} / ${state.maxIterations}`);
 
-  console.log(chalk.bold(`\n  Refinement iterations: ${report.iterations}`));
+  const spinner = state.currentTool
+    ? chalk.cyan(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])
+    : chalk.green("✓");
 
-  if (report.suggestions.length > 0) {
-    console.log(chalk.bold("\n  Suggestions for manual customization:"));
-    for (const s of report.suggestions) {
-      console.log(chalk.gray(`    - ${s}`));
+  const toolStr = state.currentTool
+    ? `${spinner} ${chalk.dim("Executing:")} ${chalk.white(truncate(state.currentTool, 30))}`
+    : `${spinner} ${chalk.dim(truncate(state.claudeText || "Idle", 40))}`;
+
+  const lines = [
+    row(`Phase: ${phaseStr}${"  ".repeat(3)}${iterStr}`),
+    row(toolStr),
+    chalk.cyan(hLine("╠", "═", "╣")),
+  ];
+  return lines.join("\n");
+}
+
+function renderEntities(state: DashboardState): string {
+  const lines: string[] = [row(chalk.bold("CREATED ENTITIES"))];
+
+  if (state.entities.length === 0) {
+    lines.push(row(chalk.dim("  (none yet)")));
+  } else {
+    for (const e of state.entities.slice(-6)) {
+      const icon = e.type === "database" ? "📊" : e.type === "view" ? "👁 " : "📄";
+      const name = truncate(e.name, 26);
+      const url = chalk.dim(shortUrl(e.url));
+      lines.push(row(`  ${icon} ${name.padEnd(27)} ${url}`));
+    }
+    if (state.entities.length > 6) {
+      lines.push(row(chalk.dim(`  ... and ${state.entities.length - 6} more`)));
     }
   }
+
+  lines.push(chalk.cyan(hLine("╠", "═", "╣")));
+  return lines.join("\n");
+}
+
+function renderScores(state: DashboardState): string | null {
+  if (!state.scores) return null;
+
+  const s = state.scores;
+  const entries: [string, number][] = [
+    ["Structural Completeness", s.structuralCompleteness],
+    ["Content Depth", s.contentDepth],
+    ["Notion Feature Usage", s.notionFeatureUsage],
+    ["Visual Organization", s.visualOrganization],
+    ["Actionability", s.actionability],
+    ["Internal Consistency", s.internalConsistency],
+  ];
+
+  const avg = entries.reduce((sum, [, v]) => sum + v, 0) / entries.length;
+  const avgColor = avg >= 4 ? chalk.green : avg >= 3 ? chalk.yellow : chalk.red;
+
+  const lines: string[] = [
+    row(`${chalk.bold("QUALITY SCORES")}${"".padEnd(15)}${avgColor(`Avg: ${avg.toFixed(1)} / 5.0`)}`),
+  ];
+
+  for (const [label, score] of entries) {
+    const bar = scoreBar(score);
+    lines.push(row(`  ${label.padEnd(26)} ${bar}  ${scoreColor(score)(`${score}/5`)}`));
+  }
+
+  lines.push(chalk.cyan(hLine("╠", "═", "╣")));
+  return lines.join("\n");
+}
+
+function scoreBar(score: number): string {
+  const filled = chalk.cyan("█".repeat(score));
+  const empty = chalk.gray("░".repeat(5 - score));
+  return filled + empty;
+}
+
+function scoreColor(score: number): (s: string) => string {
+  if (score >= 4) return chalk.green;
+  if (score >= 3) return chalk.yellow;
+  return chalk.red;
+}
+
+function renderToolLog(state: DashboardState): string {
+  const lines: string[] = [row(chalk.bold("TOOL LOG"))];
+  const entries = state.toolLog.slice(-6);
+
+  if (entries.length === 0) {
+    lines.push(row(chalk.dim("  (waiting...)")));
+  } else {
+    for (const entry of entries) {
+      const icon =
+        entry.status === "running"
+          ? chalk.cyan(SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length])
+          : entry.status === "success"
+          ? chalk.green("✓")
+          : chalk.red("✗");
+      const name = truncate(entry.name.replace("notion_", ""), 24);
+      const result = entry.result ? chalk.dim(truncate(entry.result, 22)) : "";
+      lines.push(row(`  ${icon} ${name.padEnd(25)} ${result}`));
+    }
+  }
+
+  lines.push(chalk.cyan(hLine("╚", "═", "╝")));
+  return lines.join("\n");
+}
+
+// ── Main Render ──
+
+function render(state: DashboardState): string {
+  const sections = [
+    renderHeader(state),
+    renderStatus(state),
+    renderEntities(state),
+  ];
+
+  const scores = renderScores(state);
+  if (scores) sections.push(scores);
+
+  sections.push(renderToolLog(state));
+
+  return sections.join("\n");
+}
+
+// ── Dashboard Controller ──
+
+export interface Dashboard {
+  update(partial: Partial<DashboardState>): void;
+  setPhase(phase: Phase): void;
+  addEntity(entity: CreatedEntity): void;
+  addToolLog(entry: ToolLogEntry): void;
+  markToolDone(name: string, status: "success" | "error", result?: string): void;
+  setScores(scores: QualityScores): void;
+  setClaudeText(text: string): void;
+  finish(report: BuildReport): void;
+  interruptReport(): void;
+}
+
+export function createDashboard(config: Config, prompt: string): Dashboard {
+  const state: DashboardState = {
+    phase: "STARTING",
+    round: 0,
+    maxRounds: 80,
+    iteration: 0,
+    maxIterations: config.maxIterations,
+    currentTool: null,
+    entities: [],
+    scores: null,
+    toolLog: [],
+    spinnerFrame: 0,
+    claudeText: `"${truncate(prompt, 50)}"`,
+    prompt,
+    model: config.model,
+  };
+
+  // Render at 80ms intervals for smooth spinner animation
+  const timer = setInterval(() => {
+    state.spinnerFrame++;
+    logUpdate(render(state));
+  }, 80);
+
+  function stop(): void {
+    clearInterval(timer);
+    logUpdate.clear();
+  }
+
+  return {
+    update(partial) {
+      Object.assign(state, partial);
+    },
+
+    setPhase(phase) {
+      state.phase = phase;
+      if (phase === "EVALUATE") {
+        state.iteration++;
+      }
+    },
+
+    addEntity(entity) {
+      state.entities.push(entity);
+    },
+
+    addToolLog(entry) {
+      state.toolLog.push(entry);
+    },
+
+    markToolDone(name, status, result) {
+      const entry = [...state.toolLog].reverse().find((e) => e.name === name && e.status === "running");
+      if (entry) {
+        entry.status = status;
+        if (result) entry.result = result;
+      }
+    },
+
+    setScores(scores) {
+      state.scores = scores;
+    },
+
+    setClaudeText(text) {
+      state.claudeText = text;
+      state.currentTool = null;
+    },
+
+    finish(report) {
+      stop();
+      printFinalReport(report);
+    },
+
+    interruptReport() {
+      stop();
+      printPartialReport(state.entities);
+    },
+  };
+}
+
+// ── Final Report (static, after dashboard clears) ──
+
+function printFinalReport(report: BuildReport): void {
+  const divider = chalk.dim("─".repeat(60));
+  console.log();
+  console.log(chalk.bold.green("  ✅ Build Complete!"));
+  console.log();
+  console.log(divider);
+  console.log(chalk.bold("  Created:"));
+
+  for (const e of report.entities) {
+    const icon = e.type === "database" ? "📊" : e.type === "view" ? "👁 " : "📄";
+    console.log(`    ${icon} ${chalk.bold(e.name)}`);
+    console.log(chalk.cyan(`       ${e.url}`));
+  }
+
+  console.log();
+  console.log(divider);
+
+  const s = report.scores;
+  const entries: [string, number][] = [
+    ["Structural Completeness", s.structuralCompleteness],
+    ["Content Depth", s.contentDepth],
+    ["Notion Feature Usage", s.notionFeatureUsage],
+    ["Visual Organization", s.visualOrganization],
+    ["Actionability", s.actionability],
+    ["Internal Consistency", s.internalConsistency],
+  ];
+  const avg = entries.reduce((sum, [, v]) => sum + v, 0) / entries.length;
+  const avgColor = avg >= 4 ? chalk.green : chalk.yellow;
+
+  console.log(
+    chalk.bold(`  Quality: ${avgColor(`${avg.toFixed(1)}/5.0`)} (${report.iterations} refinement ${report.iterations === 1 ? "iteration" : "iterations"})`)
+  );
+  for (const [label, score] of entries) {
+    const bar = scoreBar(score);
+    console.log(`    ${label.padEnd(28)} ${bar}  ${scoreColor(score)(`${score}/5`)}`);
+  }
+
+  if (report.suggestions.length > 0) {
+    console.log();
+    console.log(divider);
+    console.log(chalk.bold("  Suggestions:"));
+    for (const s of report.suggestions) {
+      console.log(chalk.dim(`    • ${s}`));
+    }
+  }
+
   console.log();
 }
 
-export function logPartialReport(entities: CreatedEntity[]): void {
+function printPartialReport(entities: CreatedEntity[]): void {
+  console.log();
   if (entities.length === 0) {
-    console.log(chalk.yellow("\n  No entities created yet."));
-    return;
+    console.log(chalk.yellow("  ⚠ Interrupted. No entities were created."));
+  } else {
+    console.log(chalk.yellow("  ⚠ Interrupted. Partial results:"));
+    for (const e of entities) {
+      const icon = e.type === "database" ? "📊" : e.type === "view" ? "👁 " : "📄";
+      console.log(`    ${icon} ${e.name}: ${chalk.cyan(e.url)}`);
+    }
   }
-  console.log(chalk.yellow("\n  Partial results (interrupted):"));
-  for (const entity of entities) {
-    console.log(`    - ${entity.name} (${entity.type}): ${entity.url}`);
-  }
+  console.log();
 }
